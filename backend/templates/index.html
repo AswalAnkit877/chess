@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Online Chess Matchmaking</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='libs/chessboard-1.0.0.min.css') }}" />
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <script src="{{ url_for('static', filename='libs/chess.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='libs/chessboard-1.0.0.min.js') }}"></script>
+  <script src="https://cdn.socket.io/4.4.1/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.5.1/dist/confetti.browser.min.js"></script>
+  <style>
+    /* All your existing CSS goes here, no changes needed except background images */
+    body {
+      margin: 0;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: url('{{ url_for('static', filename='bgg.webp') }}') center/cover no-repeat fixed #f0f2f5;
+      text-align: center;
+      padding-top: 120px;
+      transition: background-color 0.3s, color 0.3s;
+      color: #222;
+    }
+    /* rest of your CSS unchanged */
+  </style>
+</head>
+
+<body>
+  <header>
+    <div class="header-content">
+      <h1>♟️ Online Chess</h1>
+      <div id="matchup" style="font-size:16px;"></div>
+      <div class="top-buttons">
+        <button id="newGameBtn" style="display:none;">🔁 New Game</button>
+        <button id="darkModeBtn">🌙</button>
+        <button id="muteBtn">🔊</button>
+      </div>
+    </div>
+  </header>
+
+  <div id="modeSelect">
+    <button onclick="startBotGame()">Play vs Bot</button>
+    <button onclick="startOnlineGame()">Find Online Match</button>
+  </div>
+
+  <div id="difficultySelection" style="display:none;">
+    <h3>Select Bot Difficulty:</h3>
+    <button class="difficulty-btn" data-difficulty="easy">Easy</button>
+    <button class="difficulty-btn" data-difficulty="medium">Medium</button>
+    <button class="difficulty-btn" data-difficulty="hard">Hard</button>
+    <button class="difficulty-btn" data-difficulty="expert">Expert</button>
+  </div>
+
+  <div id="board"></div>
+
+  <div id="status">Choose a game mode above</div>
+
+  <div id="coinFlip" class="overlay">
+    <div class="modal">
+      <h2>🎲 Tossing Coin...</h2>
+      <div id="coin">
+        <img id="coinImage" src="{{ url_for('static', filename='coin.png') }}" alt="Coin Toss" width="150" style="transition: transform 1s;" />
+      </div>
+    </div>
+  </div>
+
+  <div id="tossModal" class="overlay">
+    <div class="modal">
+      <h2>🎲 You won the toss!</h2>
+      <p>Choose your color:</p>
+      <div class="toss-buttons">
+        <button id="chooseWhite" class="toss-btn white">White ♖</button>
+        <button id="chooseBlack" class="toss-btn black">Black ♜</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Audio -->
+  <audio id="moveSound" src="{{ url_for('static', filename='sounds/move.mp3') }}" preload="auto"></audio>
+  <audio id="captureSound" src="{{ url_for('static', filename='sounds/capture.mp3') }}" preload="auto"></audio>
+  <audio id="checkSound" src="{{ url_for('static', filename='sounds/check.mp3') }}" preload="auto"></audio>
+  <audio id="checkmateSound" src="{{ url_for('static', filename='sounds/checkmate.mp3') }}" preload="auto"></audio>
+  <audio id="drawSound" src="{{ url_for('static', filename='sounds/draw.mp3') }}" preload="auto"></audio>
+  <audio id="invalidSound" src="{{ url_for('static', filename='sounds/invalid.mp3') }}" preload="auto"></audio>
+  <audio id="startSound" src="{{ url_for('static', filename='sounds/start.mp3') }}" preload="auto"></audio>
+  <audio id="matchFoundSound" src="{{ url_for('static', filename='sounds/match_found.mp3') }}" preload="auto"></audio>
+  <audio id="disconnectSound" src="{{ url_for('static', filename='sounds/disconnect.mp3') }}" preload="auto"></audio>
+  <audio id="clickSound" src="{{ url_for('static', filename='sounds/click.mp3') }}" preload="auto"></audio>
+  <audio id="winSound" src="{{ url_for('static', filename='sounds/win.mp3') }}" preload="auto"></audio>
+
+<script>
+const socket = io(window.location.origin); // Use current host for deployment
+const chess = new Chess();
+let board = null;
+
+// --------------------
+// Player & Game State
+// --------------------
+let playerId = null;
+let playerName = '';
+let playerSkill = 1600;
+let playingBot = false;
+let botDifficulty = '';
+let onlineMatchStarted = false;
+let waitingForOpponent = false;
+let onlineTimeout = null;
+let playerColor = 'white';
+let isMyTurn = false;
+let currentOpponent = null;
+let roomWinner = null;
+let isMuted = false;
+
+// --------------------
+// Socket.io Setup
+// --------------------
+socket.on('set_player_id', (data) => { playerId = data.player_id; console.log("✅ Player ID:", playerId); });
+socket.on('opponent_info', data => {
+  if (playingBot) return;
+  currentOpponent = data.opponent;
+  $('#matchup').text(`${playerName} vs ${data.opponent} (${data.opponent_skill})`);
+  $('#status').text("🎯 Match found! Waiting for toss...");
+  waitingForOpponent = false;
+  if (onlineTimeout) { clearTimeout(onlineTimeout); onlineTimeout = null; }
+});
+socket.on('toss_result', tossData => {
+  roomWinner = tossData.winner;
+  $("#coinFlip").fadeIn(200).css('display', 'flex');
+  setTimeout(() => {
+    $("#coinFlip").fadeOut(200);
+    if (playerId === tossData.winner) {
+      $('#status').text("🎲 You won the toss! Choose your color.");
+      $("#tossModal").fadeIn(200).css('display', 'flex');
+      $('#chooseWhite').off('click').on('click', () => chooseColor('white'));
+      $('#chooseBlack').off('click').on('click', () => chooseColor('black'));
+    } else {
+      $('#status').text("🎲 Waiting for opponent to choose color...");
+    }
+  }, 2000);
+});
+socket.on('assign_color', assignData => { playerColor = assignData.color; setTurn(playerColor === 'white'); $("#tossModal").fadeOut(200); initializeBoard(); });
+socket.on('opponent_move', move => handleMove(move));
+socket.on('ai_move', data => { if (!data.move) return; handleMove(data.move, data.status); });
+socket.on('opponent_disconnected', () => {
+  $('#status').text("⚠️ Opponent disconnected. You can continue vs Bot.");
+  if (!roomWinner) return;
+  playingBot = true;
+  botDifficulty = 'medium';
+  if (!chess.game_over()) setTurn(true);
+  playSound('disconnectSound');
+  socket.emit('add_player', { player_id: playerId, name: playerName, skill: playerSkill, bot: true, difficulty: botDifficulty });
+});
+socket.on('disconnect', () => { $('#status').text("❌ Disconnected from server"); playSound('disconnectSound'); });
+
+// --------------------
+// Board & Moves
+// --------------------
+function initializeBoard() {
+  if (board) board.destroy();
+  chess.reset();
+  board = Chessboard('board', {
+    draggable: true,
+    position: 'start',
+    orientation: playerColor,
+    pieceTheme: '{{ url_for("static", filename="img/{piece}.png") }}',
+    onMouseoverSquare: showMoves,
+    onMouseoutSquare: removeHighlights,
+    onDragStart: dragStart,
+    onDrop: dropPiece,
+    onSnapEnd: () => board.position(chess.fen())
+  });
+  playSound('startSound');
+  updateStatus();
+}
+
+function showMoves(square, piece) {
+  if (!piece || !isMyTurn || chess.game_over()) return;
+  if ((playerColor === 'white' && piece.startsWith('b')) || 
+      (playerColor === 'black' && piece.startsWith('w'))) return;
+
+  const moves = chess.moves({ square, verbose: true });
+  if (!moves.length) return;
+  highlightSquares([square, ...moves.map(m => m.to)]);
+}
+
+function dragStart(source, piece) {
+  if (!piece || !isMyTurn || chess.game_over()) return false;
+  if ((playerColor === 'white' && piece.startsWith('b')) || 
+      (playerColor === 'black' && piece.startsWith('w'))) return false;
+  playSound('clickSound');
+  return true;
+}
+
+function dropPiece(source, target) {
+  removeHighlights();
+  const move = chess.move({ from: source, to: target, promotion: 'q' });
+  if (!move) {
+    playSound('invalidSound');
+    return 'snapback';
+  }
+
+  board.position(chess.fen());
+  setTurn(false);
+  playSound(move.captured ? 'captureSound' : 'moveSound');
+
+  if (playingBot) {
+    setTimeout(makeBotMove, 500);
+  } else {
+    socket.emit('move', { player_id: playerId, move });
+  }
+  updateStatus();
+}
+
+function handleMove(move, status = null) {
+  const result = chess.move(move);
+  if (!result) return;
+  board.position(chess.fen());
+  setTurn(true);
+  playSound(result.captured ? 'captureSound' : 'moveSound');
+
+  if (status === 'checkmate') $('#status').text("🎉 Checkmate! AI wins.");
+  else if (status === 'draw') $('#status').text("🤝 Draw!");
+
+  updateStatus();
+}
+
+// --------------------
+// Highlights & Sounds
+// --------------------
+function highlightSquares(squares) {
+  removeHighlights();
+  squares.forEach(sq => $('#board .square-' + sq).append('<div class="move-dot"></div>'));
+}
+function removeHighlights() { $('#board .move-dot').remove(); }
+function playSound(id) { if (!isMuted) document.getElementById(id)?.play(); }
+
+// --------------------
+// Turn & Status
+// --------------------
+function setTurn(turn) { isMyTurn = turn; updateStatus(); }
+
+function updateStatus() {
+  let status = '';
+  if (chess.in_checkmate()) {
+    const winner = chess.turn() === 'w' ? 'Black' : 'White';
+    status = `🎉 Game over. ${winner} wins by checkmate!`;
+    celebrateWinner(winner);
+  } else if (chess.in_draw() || chess.insufficient_material()) {
+    status = 'Game over. Draw!';
+    playSound('drawSound');
+  } else {
+    status = `${chess.turn() === 'w' ? 'White' : 'Black'} to move`;
+    if (chess.in_check()) playSound('checkSound');
+  }
+  $('#status').text(status);
+}
+
+function celebrateWinner(winnerColor) {
+  playSound('checkmateSound');
+  setTimeout(() => playSound('winSound'), 1000);
+  $('#status').text(`🎉 ${winnerColor} wins!`);
+  if (typeof confetti !== 'undefined') confetti({ particleCount: 250, spread: 90, origin: { y: 0.6 } });
+  $('body').css('background-color', '#d1e7dd');
+  setTimeout(() => $('body').css('background-color', '#f0f2f5'), 1500);
+}
+
+// --------------------
+// Bot Moves
+// --------------------
+function makeBotMove() {
+  if (!botDifficulty) return alert("Select bot difficulty!");
+  socket.emit('get_ai_move', { player_id: playerId, fen: chess.fen(), difficulty: botDifficulty });
+}
+
+// --------------------
+// Bot Difficulty Selection
+// --------------------
+$('.difficulty-btn').click(function () {
+  botDifficulty = $(this).data('difficulty');
+  if (!botDifficulty) return alert("Select a valid difficulty!");
+
+  $('#difficultySelection').hide();
+  $('#status').text(`🤖 Playing bot (${botDifficulty})`);
+  playSound('clickSound');
+  initializeBoard();
+  setTurn(true);
+  $('#newGameBtn').show();
+  $('.difficulty-btn').prop('disabled', true);
+
+  socket.emit('add_player', {
+    player_id: playerId,
+    name: playerName || `Player${playerId}`,
+    skill: playerSkill,
+    bot: true,
+    difficulty: botDifficulty
+  });
+});
+
+// --------------------
+// Start Game
+// --------------------
+function startBotGame() {
+  $('#modeSelect').hide();
+  $('#difficultySelection').show();
+  $('#status').text("🤖 Select bot difficulty");
+  playingBot = true;
+  playerColor = 'white';
+  playSound('clickSound');
+}
+
+function startOnlineGame() {
+  $('#modeSelect').hide();
+  playingBot = false;
+  waitingForOpponent = true;
+
+  const nameInput = prompt("Enter your name:");
+  if (!nameInput) { $('#modeSelect').show(); return; }
+  const skillInput = prompt("Enter skill rating (default 1600):", "1600");
+  if (!skillInput) { $('#modeSelect').show(); return; }
+
+  playerName = nameInput.trim() || `Player${playerId}`;
+  playerSkill = parseInt(skillInput) || 1600;
+  $('#status').text("👤 Searching for opponent...");
+  playSound('clickSound');
+
+  socket.emit('add_player', {
+    player_id: playerId,
+    name: playerName,
+    skill: playerSkill,
+    bot: false,
+    auto_bot_after_timeout: true
+  });
+
+  onlineTimeout = setTimeout(() => {
+    if (waitingForOpponent && !roomWinner && !currentOpponent) {
+      playingBot = true;
+      botDifficulty = 'medium';
+      $('#status').text("🤖 No opponent found. Auto-playing vs Bot.");
+      initializeBoard();
+      setTurn(true);
+      $('#newGameBtn').show();
+      waitingForOpponent = false;
+
+      socket.emit('add_player', {
+        player_id: playerId,
+        name: playerName,
+        skill: playerSkill,
+        bot: true,
+        difficulty: botDifficulty
+      });
+    }
+  }, 60000);
+}
+
+// --------------------
+// Color Choice
+// --------------------
+function chooseColor(color) {
+  playerColor = color;
+  setTurn(color === 'white');
+  $("#tossModal").fadeOut(200);
+  $('#status').text(`🎲 You chose ${color}`);
+  initializeBoard();
+  socket.emit('color_choice', { player_id: playerId, color });
+}
+
+// --------------------
+// UI Controls
+// --------------------
+document.getElementById("muteBtn").addEventListener("click", () => {
+  isMuted = !isMuted;
+  document.getElementById("muteBtn").textContent = isMuted ? "🔇" : "🔊";
+  document.querySelectorAll("audio").forEach(audio => audio.muted = isMuted);
+});
+
+document.getElementById("darkModeBtn").addEventListener("click", () => {
+  document.body.classList.toggle("dark");
+  document.getElementById("darkModeBtn").textContent = document.body.classList.contains("dark") ? "☀️" : "🌙";
+});
+
+document.getElementById('newGameBtn').addEventListener('click', () => {
+  if (confirm("Start a new game? Your current game will end.")) location.reload();
+});
+</script>
+
+
+</body>
+
+</html>
